@@ -1,0 +1,141 @@
+import torch
+import os
+import numpy as np
+from torch.utils.data import DataLoader, Dataset
+import torch.nn.functional as F
+import torch.nn as nn
+from lib_siam import SiameseNetwork
+import pickle
+import torch
+import shutil
+
+def val_func(classifier, test_loader):
+    classifier.eval()
+    val_correct_pos = 0
+    val_correct_neg = 0
+    val_total_pos = 0
+    val_total_neg = 0
+    
+    with torch.no_grad():
+        for test_data, test_labels in test_loader:
+            test_data = test_data.squeeze(1)  # Adjust shape from (batch_size, 1, 14) to (batch_size, 14)
+            test_outputs = classifier(test_data)
+            test_outputs = test_outputs.squeeze(1) 
+            predictions = (test_outputs >= (classifier.tau)).float()
+
+            # 统计正样本
+            pos_indices = (test_labels == 1)
+            val_correct_pos += (predictions[pos_indices] == test_labels[pos_indices].float()).sum().item()
+            val_total_pos += pos_indices.sum().item()
+
+            # 统计负样本
+            neg_indices = (test_labels == 0)
+            val_correct_neg += (predictions[neg_indices] == test_labels[neg_indices].float()).sum().item()
+            val_total_neg += neg_indices.sum().item()
+
+    # 计算准确率
+    val_accuracy_pos = val_correct_pos / val_total_pos if val_total_pos > 0 else 0
+    val_accuracy_neg = val_correct_neg / val_total_neg if val_total_neg > 0 else 0
+
+    return val_accuracy_pos, val_accuracy_neg, val_total_pos, val_total_neg
+
+def natural_sort_key(filename):
+
+    return [int(part) if part.isdigit() else part for part in filename.replace('.pt', '').split('_')]
+
+
+def get_data(Dataset, neg_users):
+    all_data = []
+    for neg_user in neg_users:
+        neg_user_dir = os.path.join(Dataset, neg_user)
+        all_file_names = os.listdir(neg_user_dir)
+        all_file_names.remove('mean_feature.pt')
+        sorted_file_names = sorted(all_file_names, key=natural_sort_key)
+        sorted_file_names.append('mean_feature.pt')
+        for file_name in sorted_file_names:
+            file_path = os.path.join(neg_user_dir, file_name)
+            data = torch.load(file_path)
+            label = file_name.split("_")[0]
+            # if label == "1":
+            #     print(file_name)
+            all_data.append((data, file_name.split(".pt")[0], label))
+    return all_data
+
+def load_model(SaveModelPath, input_dim):
+    model = SiameseNetwork(input_dim=input_dim)
+    model.load_state_dict(torch.load(SaveModelPath))
+    model.eval()
+    return model
+
+
+def get_paired(pos_list, num_time=2):
+    final_pos_list = []
+    for ii in range(len(pos_list) -num_time + 1):
+        tmp_value = 0
+        for jj in range(num_time):
+            tmp_value += pos_list[ii + jj]
+        if tmp_value > 0:
+            final_pos_list.append(1)
+        else:
+            final_pos_list.append(0)
+    return final_pos_list
+
+def NeckPass(ModelPath):
+    Dataset = "NeckpassDataset"
+    pos_user_list =  os.listdir(Dataset) 
+    loop = len(pos_user_list)
+    TPR_list = []
+    TNR_list = []
+    BAC_list = []
+    User_name = []
+    for i in range(loop):
+        pos_users = [pos_user_list[i]]
+        model_name = f"{pos_users[0]}"
+        all_users_data = get_data(Dataset, pos_users)
+        input_dim = all_users_data[0][0].shape[0]
+        modelpath = os.path.join(ModelPath, f"classifier_{model_name}.pth")
+        model = load_model(modelpath, input_dim)
+        mean_feature = torch.load(f"{Dataset}/{model_name}/mean_feature.pt")
+        model.anchor = mean_feature
+        model.eval()
+        output_dir =f"{Dataset}_pre/{model_name}"
+        if os.path.exists(output_dir):
+            shutil.rmtree(output_dir)
+        os.makedirs(output_dir, exist_ok=True)
+        pos_list = []
+        neg_list = []
+        for ii, (data, file_name, label) in enumerate(all_users_data):
+            if "mean" in label:
+                new_file_path = f"{output_dir}/mean_feature.pt"
+                torch.save(data, new_file_path)
+                continue
+            _,_, outputs = model(data)
+            preds_label = (outputs[0] >= model.tau)
+            if label == "1":
+                if preds_label:
+                    pos_list.append(1)
+                else:
+                    pos_list.append(0)
+            elif label == "0":
+                if preds_label:
+                    neg_list.append(1)
+                else:
+                    neg_list.append(0)
+            new_file_path = f"{output_dir}/{file_name}_{1 if preds_label else 0}.pt"
+            torch.save(data, new_file_path)
+        pos_list = get_paired(pos_list,2)
+        neg_list = get_paired(neg_list,2)
+        count_pos = pos_list.count(1)
+        count_neg = neg_list.count(1)
+        TPR = (count_pos/len(pos_list)*100) if len(pos_list) > 0 else 0
+        TPR_list.append(TPR)
+        TNR = (1 - count_neg/len(neg_list)) * 100 if len(neg_list) > 0 else 0
+        TNR_list.append(TNR)
+        BAC = (TPR + TNR) / 2
+        BAC_list.append(BAC)
+        User_name.append(model_name)
+    print(f"No, User_name      ----   TPR,      TNR,      BAC")
+    for i, (user_name, TPR, TNR, BAC) in enumerate(zip(User_name, TPR_list, TNR_list, BAC_list)):
+        print(f"{i:<2},{user_name:<15} ----   {TPR:.2f}%,   {TNR:.2f}%,   {BAC:.2f}%")
+
+    print(f"\n[Average]    ----   {np.mean(TPR_list):.2f}%,   {np.mean(TNR_list):.2f}%,   {np.mean(BAC_list):.2f}%")
